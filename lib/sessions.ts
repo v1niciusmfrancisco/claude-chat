@@ -10,6 +10,7 @@ import {
   extractParentSessionId,
   isInternalCommand,
 } from "./parser";
+import { calculateCost } from "./pricing";
 
 const CLAUDE_DIR = path.join(os.homedir(), ".claude", "projects");
 
@@ -57,11 +58,12 @@ function readIndex(projectDir: string): Map<string, IndexEntry> {
  * Reads only the first 32KB to avoid parsing large files.
  */
 function detectParentSessionId(filePath: string): string | null {
+  // Read 256KB — continuation summaries can be very large
   const fd = fs.openSync(filePath, "r");
-  const buf = Buffer.alloc(32768);
-  fs.readSync(fd, buf, 0, buf.length, 0);
+  const buf = Buffer.alloc(262144);
+  const bytesRead = fs.readSync(fd, buf, 0, buf.length, 0);
   fs.closeSync(fd);
-  const head = buf.toString("utf-8");
+  const head = buf.toString("utf-8", 0, bytesRead);
 
   if (!head.includes("read the full transcript at:")) return null;
 
@@ -78,6 +80,34 @@ function detectParentSessionId(filePath: string): string | null {
   return null;
 }
 
+/**
+ * Scan a JSONL file for total cost only.
+ * Faster than scanJsonlLightweight — only parses assistant records.
+ */
+function usageKey(usage: Record<string, unknown>): string {
+  return `${usage.input_tokens}:${usage.output_tokens}:${usage.cache_creation_input_tokens || 0}:${usage.cache_read_input_tokens || 0}`;
+}
+
+function scanFileCost(filePath: string): number {
+  let cost = 0;
+  let prevUsageKey = "";
+  const raw = fs.readFileSync(filePath, "utf-8");
+  const lines = raw.split("\n");
+  for (const line of lines) {
+    if (!line.trim()) continue;
+    const t = quickTypeCheck(line);
+    if (t !== "assistant") continue;
+    const rec = parseRecord(line);
+    if (rec?.message?.usage && rec.message.model) {
+      const key = usageKey(rec.message.usage as Record<string, unknown>);
+      if (key === prevUsageKey) continue; // streaming duplicate
+      prevUsageKey = key;
+      cost += calculateCost(rec.message.model, rec.message.usage);
+    }
+  }
+  return cost;
+}
+
 function scanJsonlLightweight(
   filePath: string,
   sessionId: string,
@@ -91,6 +121,8 @@ function scanJsonlLightweight(
   let slug = "";
   let firstTimestamp = "";
   let parentSessionId: string | null = null;
+  let totalCost = 0;
+  let prevUsageK = "";
 
   const raw = fs.readFileSync(filePath, "utf-8");
   const lines = raw.split("\n");
@@ -101,10 +133,11 @@ function scanJsonlLightweight(
     if (!t) continue;
 
     if (t === "user") {
-      userCount++;
       const rec = parseRecord(line);
       if (rec?.message) {
-        if (!firstPrompt && !isInternalCommand(rec.message.content)) {
+        if (isInternalCommand(rec.message.content)) continue;
+        userCount++;
+        if (!firstPrompt) {
           firstPrompt = extractFirstPrompt(rec.message.content);
           gitBranch = rec.gitBranch || "";
           slug = rec.slug || "";
@@ -116,6 +149,14 @@ function scanJsonlLightweight(
       }
     } else if (t === "assistant") {
       assistantCount++;
+      const rec = parseRecord(line);
+      if (rec?.message?.usage && rec.message.model) {
+        const key = usageKey(rec.message.usage as Record<string, unknown>);
+        if (key !== prevUsageK) {
+          totalCost += calculateCost(rec.message.model, rec.message.usage);
+          prevUsageK = key;
+        }
+      }
     }
   }
 
@@ -136,6 +177,7 @@ function scanJsonlLightweight(
     slug,
     fullPath: filePath,
     parentSessionId: parentSessionId || undefined,
+    costUSD: totalCost > 0 ? totalCost : undefined,
   };
 }
 
@@ -157,11 +199,12 @@ export function listSessions(): SessionMeta[] {
     const index = readIndex(projectDir);
     const indexedIds = new Set(index.keys());
 
-    // Add indexed sessions
+    // Add indexed sessions — use index for metadata, scan file for cost + parent
     for (const [, entry] of index) {
       if (entry.messageCount < 2) continue;
 
       const parentId = detectParentSessionId(entry.fullPath);
+      const cost = scanFileCost(entry.fullPath);
 
       allSessions.push({
         sessionId: entry.sessionId,
@@ -175,6 +218,7 @@ export function listSessions(): SessionMeta[] {
         gitBranch: entry.gitBranch || "",
         fullPath: entry.fullPath,
         parentSessionId: parentId || undefined,
+        costUSD: cost > 0 ? cost : undefined,
       });
     }
 
@@ -234,10 +278,13 @@ export function listSessions(): SessionMeta[] {
 
     const root = sessionsById.get(rootId);
     if (root) {
-      // Merge into root: combined count, latest modified
+      // Merge into root: combined count, latest modified, cost
       root.messageCount += s.messageCount;
       if (new Date(s.modified) > new Date(root.modified)) {
         root.modified = s.modified;
+      }
+      if (s.costUSD) {
+        root.costUSD = (root.costUSD || 0) + s.costUSD;
       }
     }
 
@@ -268,6 +315,7 @@ function readMessages(filePath: string): {
   let slug = "";
   let firstPrompt = "";
   let parentSessionId: string | null = null;
+  let prevUsageK = "";
 
   for (const line of lines) {
     if (!line.trim()) continue;
@@ -279,6 +327,16 @@ function readMessages(filePath: string): {
 
     const msg = recordToMessage(rec);
     if (!msg) continue;
+
+    // Deduplicate cost on streaming delta records (same API call = identical usage)
+    if (msg.type === "assistant" && msg.costUSD && msg.usage) {
+      const key = usageKey(msg.usage as unknown as Record<string, unknown>);
+      if (key === prevUsageK) {
+        msg.costUSD = undefined;
+      } else {
+        prevUsageK = key;
+      }
+    }
 
     if (!gitBranch && rec.gitBranch) gitBranch = rec.gitBranch;
     if (!slug && rec.slug) slug = rec.slug;
@@ -305,14 +363,15 @@ export interface SessionSegment {
  * Walk forward from a root session, collecting the full chain.
  * Returns ordered list of session IDs: [root, child1, child2, ...]
  */
+/**
+ * Walk forward from a root session, collecting the full chain.
+ * Handles both linear chains and branching (multiple resumes from same session).
+ * Returns ordered list of session IDs sorted by file modification time.
+ */
 function walkChainForward(
   rootId: string,
   projectDir: string
 ): string[] {
-  const chain = [rootId];
-  let currentId = rootId;
-  const visited = new Set<string>([rootId]);
-
   // Scan all JSONL files to find children
   let files: string[];
   try {
@@ -320,27 +379,44 @@ function walkChainForward(
       .readdirSync(projectDir)
       .filter((f) => f.endsWith(".jsonl"));
   } catch {
-    return chain;
+    return [rootId];
   }
 
-  // Build parent→child map for this directory
-  const parentToChild = new Map<string, string>();
+  // Build parent→children map (one parent can have multiple children)
+  const parentToChildren = new Map<string, string[]>();
   for (const file of files) {
     const sessionId = file.replace(".jsonl", "");
     const filePath = path.join(projectDir, file);
     const parentId = detectParentSessionId(filePath);
     if (parentId) {
-      parentToChild.set(parentId, sessionId);
+      const existing = parentToChildren.get(parentId) || [];
+      existing.push(sessionId);
+      parentToChildren.set(parentId, existing);
     }
   }
 
-  // Walk forward
-  while (true) {
-    const childId = parentToChild.get(currentId);
-    if (!childId || visited.has(childId)) break;
-    visited.add(childId);
-    chain.push(childId);
-    currentId = childId;
+  // BFS to collect all descendants, sorted by file mtime
+  const chain = [rootId];
+  const visited = new Set<string>([rootId]);
+  const queue = [rootId];
+
+  while (queue.length > 0) {
+    const currentId = queue.shift()!;
+    const children = parentToChildren.get(currentId) || [];
+
+    // Sort children by modification time
+    children.sort((a, b) => {
+      const aStat = fs.statSync(path.join(projectDir, `${a}.jsonl`));
+      const bStat = fs.statSync(path.join(projectDir, `${b}.jsonl`));
+      return aStat.mtimeMs - bStat.mtimeMs;
+    });
+
+    for (const childId of children) {
+      if (visited.has(childId)) continue;
+      visited.add(childId);
+      chain.push(childId);
+      queue.push(childId);
+    }
   }
 
   return chain;
@@ -478,6 +554,12 @@ export function getSession(sessionId: string): {
     }
   }
 
+  // Compute authoritative cost from unified messages
+  let totalCost = 0;
+  for (const msg of allMessages) {
+    if (msg.costUSD) totalCost += msg.costUSD;
+  }
+
   const stat = fs.statSync(filePath);
 
   const meta: SessionMeta = {
@@ -492,6 +574,7 @@ export function getSession(sessionId: string): {
     gitBranch: indexEntry?.gitBranch || rootResult.gitBranch,
     slug: rootResult.slug,
     fullPath: filePath,
+    costUSD: totalCost > 0 ? totalCost : undefined,
   };
 
   return { messages: allMessages, meta, segments };

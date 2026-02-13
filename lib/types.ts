@@ -11,6 +11,7 @@ export interface SessionMeta {
   slug?: string;
   fullPath: string;
   parentSessionId?: string;
+  costUSD?: number;
 }
 
 export interface ContentBlock {

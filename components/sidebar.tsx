@@ -195,7 +195,12 @@ export function Sidebar({
                         {s.gitBranch}
                       </span>
                     )}
-                    <span className="text-[9px] text-zinc-700 ml-auto">
+                    <span className="text-[9px] text-zinc-700 ml-auto flex items-center gap-2">
+                      {s.costUSD != null && s.costUSD > 0 && (
+                        <span className="text-orange-800">
+                          ${s.costUSD < 0.01 ? "<0.01" : s.costUSD.toFixed(2)}
+                        </span>
+                      )}
                       {relativeDate(s.modified)}
                     </span>
                   </div>

@@ -1,4 +1,5 @@
 import { ConversationMessage, ContentBlock } from "./types";
+import { calculateCost } from "./pricing";
 
 interface RawRecord {
   type: string;
@@ -81,7 +82,9 @@ export function recordToMessage(rec: RawRecord): ConversationMessage | null {
     content: rec.message.content,
     model: rec.message.model,
     usage: rec.message.usage,
-    costUSD: rec.costUSD,
+    costUSD: rec.message.usage && rec.message.model
+      ? calculateCost(rec.message.model, rec.message.usage)
+      : undefined,
     gitBranch: rec.gitBranch,
     slug: rec.slug,
   };

@@ -35,7 +35,6 @@ export function ChatView({
   segments: SessionSegment[];
 }) {
   const totalUsage: Usage = { input_tokens: 0, output_tokens: 0 };
-  let totalCost = 0;
   let model = "";
 
   for (const msg of messages) {
@@ -43,9 +42,10 @@ export function ChatView({
       totalUsage.input_tokens += msg.usage.input_tokens;
       totalUsage.output_tokens += msg.usage.output_tokens;
     }
-    if (msg.costUSD) totalCost += msg.costUSD;
     if (msg.model && !model) model = msg.model;
   }
+
+  const totalCost = meta.costUSD || 0;
 
   const title = meta.summary || meta.firstPrompt || "Untitled Session";
 
@@ -69,7 +69,7 @@ export function ChatView({
             </span>
           )}
           {totalCost > 0 && (
-            <span className="text-zinc-700">${totalCost.toFixed(2)}</span>
+            <span className="text-orange-700 font-medium">${totalCost.toFixed(2)}</span>
           )}
         </div>
         {segments.length > 1 && (
