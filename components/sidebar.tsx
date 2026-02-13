@@ -111,7 +111,7 @@ export function Sidebar({
       <div className="p-3 border-b border-zinc-800/80">
         <div className="flex items-center gap-2 mb-2">
           <span className="text-orange-500 text-xs font-bold tracking-wider">
-            CLAUDE CODE
+            CLAUDE CHAT
           </span>
           <span className="text-zinc-700 text-[10px]">
             {sessions.length}
