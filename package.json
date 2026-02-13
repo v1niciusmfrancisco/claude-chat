@@ -1,7 +1,12 @@
 {
-  "name": "claude-code-ui",
+  "name": "claude-chat",
   "version": "0.1.0",
-  "private": true,
+  "description": "A local web UI for browsing Claude Code conversations",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/v1niciusmfrancisco/claude-chat.git"
+  },
   "scripts": {
     "dev": "next dev --turbopack",
     "build": "next build",
