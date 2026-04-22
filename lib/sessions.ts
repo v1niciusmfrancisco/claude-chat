@@ -203,6 +203,9 @@ export function listSessions(): SessionMeta[] {
     for (const [, entry] of index) {
       if (entry.messageCount < 2) continue;
 
+      // Skip stale index entries whose JSONL file has been deleted
+      if (!fs.existsSync(entry.fullPath)) continue;
+
       const parentId = detectParentSessionId(entry.fullPath);
       const cost = scanFileCost(entry.fullPath);
 
